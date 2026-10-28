@@ -3372,7 +3372,31 @@ fn node_not_listening(base_url: &str, err: &dyn std::fmt::Display) -> String {
     format!(
         "no XERJ node is listening at {base}. xerj mcp does not start a node. \
          Start one with:\n  {START_LOCAL_NODE}\n\
-         then retry this tool. ({err})"
+         then retry this tool. ({err}){}",
+        dead_node_note(base_url)
+    )
+}
+
+/// #2455: "nothing is listening" reads the same whether a node was never set
+/// up or one was running and died, and an agent takes the second for a broken
+/// install. A dead node leaves its data dir's `node.lock` behind, naming the
+/// PID — so when the URL is loopback and that PID is gone, say so.
+///
+/// Empty (not a sentence) when there is nothing to report: no local data dir,
+/// no lock, or a PID that is alive or cannot be checked.
+fn dead_node_note(base_url: &str) -> String {
+    let Some(dir) = xerj_common::localauth::discover_local_data_dir_for_url(base_url) else {
+        return String::new();
+    };
+    let Some(pid) = xerj_engine::recorded_holder_that_is_gone(&dir) else {
+        return String::new();
+    };
+    format!(
+        "\n\nNote: a XERJ node was running against {} (pid {pid}) and is no longer \
+         alive — its node.lock is still there, which is why nothing answers on this \
+         port. Restart it against that data dir, or point XERJ_URL at the port a live \
+         node is on.",
+        dir.display()
     )
 }
 
@@ -6301,6 +6325,90 @@ mod tests {
         // default, which is exactly the `xerj init` entry.
         let (auth, _) = resolve_auth(None, None, DEFAULT_XERJ_URL);
         assert_eq!(auth.as_deref(), Some("ApiKey local-admin-key"));
+    }
+
+    /// A PID that is definitely not running: spawn a process that exits, wait
+    /// for it, and keep the PID. A random number could belong to a live
+    /// process on a busy machine and make the test flaky. Confirmed with the
+    /// same predicate the message uses, so the helper cannot disagree with it.
+    fn reaped_pid() -> u32 {
+        let probe = tempfile::tempdir().unwrap();
+        for _ in 0..20 {
+            let mut cmd = if cfg!(windows) {
+                let mut cmd = std::process::Command::new("cmd");
+                cmd.args(["/C", "exit", "0"]);
+                cmd
+            } else {
+                std::process::Command::new("true")
+            };
+            let mut child = cmd.spawn().expect("spawn a process that exits");
+            let pid = child.id();
+            child.wait().unwrap();
+            std::fs::write(probe.path().join("node.lock"), format!("{pid}\n")).unwrap();
+            if xerj_engine::recorded_holder_that_is_gone(probe.path()) == Some(pid) {
+                return pid;
+            }
+        }
+        panic!("could not observe a reaped pid");
+    }
+
+    /// #2455: a node that was running and died leaves its data dir's
+    /// `node.lock` behind. "No node is listening" alone reads as a broken
+    /// install; the message must name the dead PID so the reader restarts the
+    /// node instead of debugging the binary.
+    #[test]
+    fn node_not_listening_names_the_node_that_died_from_its_node_lock() {
+        let sandbox = Sandbox::new();
+        let dead = reaped_pid();
+        sandbox.write("data/node.lock", &format!("{dead}\n"));
+        let msg = node_not_listening("http://localhost:9200", &"connection refused");
+        assert!(msg.contains(&format!("pid {dead}")), "{msg}");
+        assert!(msg.contains("no longer alive"), "{msg}");
+        assert!(
+            msg.contains(&sandbox.dir.path().join("data").display().to_string()),
+            "the data dir must be named, or the reader cannot restart the right node: {msg}"
+        );
+        // The pre-existing half of the sentence is still there and still first.
+        assert!(
+            msg.starts_with("no XERJ node is listening at http://localhost:9200."),
+            "{msg}"
+        );
+        assert!(msg.contains("xerj mcp does not start a node"), "{msg}");
+    }
+
+    /// The other half of #2455: never invent a dead node. No lock file, an
+    /// unparseable lock, and a lock naming a live process all leave the
+    /// message exactly as it was.
+    #[test]
+    fn node_not_listening_does_not_invent_a_dead_node() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/admin.key", "local-admin-key\n");
+        let plain = node_not_listening("http://localhost:9200", &"connection refused");
+        assert!(!plain.contains("no longer alive"), "{plain}");
+
+        // This process is alive, so a lock naming it is not a death.
+        sandbox.write("data/node.lock", &format!("{}\n", std::process::id()));
+        let live = node_not_listening("http://localhost:9200", &"connection refused");
+        assert!(!live.contains("no longer alive"), "{live}");
+
+        sandbox.write("data/node.lock", "not a pid\n");
+        let junk = node_not_listening("http://localhost:9200", &"connection refused");
+        assert!(!junk.contains("no longer alive"), "{junk}");
+    }
+
+    /// The probe is loopback-only. A remote URL's port says nothing about a
+    /// directory on this machine, and reading one to explain a failure would
+    /// report a stranger's data dir to the caller.
+    #[test]
+    fn a_dead_node_note_is_never_derived_from_a_remote_url() {
+        let sandbox = Sandbox::new();
+        sandbox.write("data/node.lock", &format!("{}\n", reaped_pid()));
+        assert_eq!(
+            xerj_common::localauth::discover_local_data_dir_for_url("http://example.com:9200"),
+            None
+        );
+        let msg = node_not_listening("http://example.com:9200", &"connection refused");
+        assert!(!msg.contains("no longer alive"), "{msg}");
     }
 
     /// Discovery is loopback-only. A locally readable admin key sent to a

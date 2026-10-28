@@ -207,6 +207,20 @@ pub fn data_dir_lock_held(dir: &Path) -> bool {
     }
 }
 
+/// The PID `dir/node.lock` records when that process is no longer running.
+///
+/// `None` when the file is missing, unreadable, holds no PID, or names a
+/// process that is alive or cannot be checked.
+///
+/// Diagnostic only: [`acquire`] makes its own staleness decision, and on
+/// Windows a dead PID does not by itself mean the OS lock is free. `xerj mcp`
+/// uses this to tell "a node was running here and died" from "no node was ever
+/// started" when nothing answers on the port (#2455).
+pub fn recorded_holder_that_is_gone(dir: &Path) -> Option<u32> {
+    let pid = read_holder(&dir.join(LOCK_NAME))?;
+    (pid_liveness(pid) == Liveness::Dead).then_some(pid)
+}
+
 fn config_err(reason: String) -> EngineError {
     EngineError::Common(xerj_common::XerjError::config(reason))
 }

@@ -43,6 +43,10 @@
 //! not under the working tree. None of that changes which key is chosen; it
 //! makes the choice visible, and `--api-key` / `XERJ_API_KEY` still win.
 //!
+//! [`discover_local_data_dir_for_url`] answers the neighbour question "which
+//! directory on this machine does that port belong to", so a caller can read
+//! the state a node left behind (`node.lock`) when it is not answering (#2455).
+//!
 //! The URL parsing uses a real parser (`url::Url`, the same type reqwest
 //! re-exports) rather than string surgery, because the hand-rolled version
 //! of this was wrong in a way that leaked credentials: splitting on the
@@ -309,6 +313,45 @@ fn local_admin_key_candidates(
         paths.push((home.join(".xerj/admin.key"), KeyOrigin::Home));
     }
     paths
+}
+
+/// The data dir a node on `url`'s port is, or was, serving — the directory
+/// holding that node's `node.lock` and `admin.key` (#2455).
+///
+/// `None` for a non-loopback URL: the answer is a path on *this* machine, and
+/// a remote URL's port says nothing about it.
+///
+/// The server records its data dir in `~/.xerj/by-port/<port>` on boot — the
+/// file holds the absolute path of that node's `admin.key`, whose directory is
+/// the data dir — and that pointer outlives the node. Without one, the same
+/// candidates [`discover_local_admin_key`] reads are scanned for `node.lock`
+/// as well as `admin.key`, because a node killed before it minted its key
+/// still left a lock.
+pub fn discover_local_data_dir_for_url(url: &str) -> Option<PathBuf> {
+    if !url_is_loopback(url) {
+        return None;
+    }
+    if let Some(pointer) = port_pointer(xerj_url_port(url)) {
+        if let Ok(text) = std::fs::read_to_string(&pointer) {
+            // `parent()` of a bare file name is `""`, which names no dir.
+            if let Some(dir) = PathBuf::from(text.trim())
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+            {
+                return Some(dir.to_path_buf());
+            }
+        }
+    }
+    let cwd = std::env::current_dir().ok();
+    let home = crate::home::home_dir();
+    local_admin_key_candidates(cwd.as_deref(), home.as_deref())
+        .into_iter()
+        .find_map(|(key_path, _origin)| {
+            let dir = key_path.parent()?.to_path_buf();
+            // A candidate whose own key file exists is a live-enough data dir;
+            // a node killed before minting one left only the lock.
+            (key_path.exists() || dir.join("node.lock").exists()).then_some(dir)
+        })
 }
 
 #[cfg(test)]

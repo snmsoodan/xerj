@@ -59,7 +59,7 @@ pub use index::{
     storage_mode_from_config, EnrichTable, FieldEncodingInfo, Index, IndexResponse, IndexStats,
     LogFormat,
 };
-pub use node_lock::data_dir_lock_held;
+pub use node_lock::{data_dir_lock_held, recorded_holder_that_is_gone};
 // Second-brain graph expansion (bounded columnar traversal over an edges
 // index). Lives under `index` for private-field access; re-exported at the
 // crate root so callers write `xerj_engine::graph::GraphExpandRequest`.
