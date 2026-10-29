@@ -18241,45 +18241,76 @@ impl Index {
         boost: Option<f32>,
         min_similarity: Option<f32>,
     ) -> Result<SearchResult> {
-        // #1091: an unfiltered scan first ranks from vector columns alone and
-        // hydrates only the winners. It hands the request back (`None`) when a
-        // winner's segment can no longer be read — a merge retired it between
-        // scoring and hydration — and the scan below then answers from the
-        // stored documents, exactly as it always did.
-        if filter.is_none() {
-            if let Some(result) = self
+        // #2473: the scan brackets its capture (#1220) and answers a straddling
+        // publication with the typed recapture signal `search()`'s admission
+        // loop handles (#1013). This entry point has no such loop, and the
+        // signal is deliberately opaque to callers — `CollectionCaptureCrossedPublication`
+        // and `is_collection_capture_retry` are both private — so the only
+        // documented failure of `run_knn_brute_force` under a concurrent flush
+        // or merge was an unactionable `Fts(collection capture crossed a
+        // publication)`. That is the intermittent failure in #2473, where the
+        // exact-scan test fails 7 runs in 10 inside its group and passes alone:
+        // a background flush straddles the capture, nothing in the test can
+        // recognise the signal, and the run dies. Wait the bracket out here,
+        // bounded by the request deadline, exactly as `search()` does.
+        loop {
+            // #1091: an unfiltered scan first ranks from vector columns alone
+            // and hydrates only the winners. It hands the request back (`None`)
+            // when a winner's segment can no longer be read — a merge retired
+            // it between scoring and hydration — and the scan below then
+            // answers from the stored documents, exactly as it always did.
+            if filter.is_none() {
+                match self
+                    .run_knn_exact_scan(
+                        request,
+                        deadline,
+                        field,
+                        query_vec,
+                        k,
+                        None,
+                        similarity,
+                        boost,
+                        min_similarity,
+                        true,
+                    )
+                    .await
+                {
+                    Ok(Some(result)) => return Ok(result),
+                    Ok(None) => {}
+                    Err(e) if is_collection_capture_retry(&e) => {
+                        if !wait_out_crossed_capture(deadline).await {
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let result = match self
                 .run_knn_exact_scan(
                     request,
                     deadline,
                     field,
                     query_vec,
                     k,
-                    None,
+                    filter.clone(),
                     similarity,
                     boost,
                     min_similarity,
-                    true,
+                    false,
                 )
-                .await?
+                .await
             {
-                return Ok(result);
-            }
+                Err(e) if is_collection_capture_retry(&e) => {
+                    if !wait_out_crossed_capture(deadline).await {
+                        return Err(e);
+                    }
+                    continue;
+                }
+                other => other?,
+            };
+            return Ok(result.expect("a scan over stored documents always answers"));
         }
-        let result = self
-            .run_knn_exact_scan(
-                request,
-                deadline,
-                field,
-                query_vec,
-                k,
-                filter,
-                similarity,
-                boost,
-                min_similarity,
-                false,
-            )
-            .await?;
-        Ok(result.expect("a scan over stored documents always answers"))
     }
 
     /// The exact kNN scan. With `columns_only` (honoured only unfiltered and
@@ -36192,6 +36223,24 @@ fn is_collection_capture_retry(e: &EngineError) -> bool {
         e,
         EngineError::Fts(err) if err.downcast_ref::<CollectionCaptureCrossedPublication>().is_some()
     )
+}
+
+/// #2473: wait for the bracket that straddled a capture to close, and report
+/// whether there is deadline left to recapture. Polls rather than awaiting
+/// [`CollectionPublication::notified`] because the notification has to be
+/// registered before the generation is read to be race-free, and the read
+/// happens several frames down inside the scan; a 1 ms poll of a bracket that a
+/// flush or merge holds for milliseconds costs nothing and cannot miss a wake.
+/// Returns `false` once the deadline is gone, so the caller surfaces the last
+/// real error instead of inventing an empty result.
+async fn wait_out_crossed_capture(deadline: std::time::Instant) -> bool {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(1);
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    tokio::time::sleep(POLL.min(deadline - now)).await;
+    std::time::Instant::now() < deadline
 }
 
 /// #1212 — the verdict of one LIVE version-map entry read during a scan whose
@@ -65013,6 +65062,67 @@ mod exact_scan_hydration_tests {
             "columns were never published"
         );
         assert_scan_matches_legacy(&idx, "body_vector", false).await;
+    }
+
+    /// #2473: the exact scan answered a straddling publication with the typed
+    /// recapture signal, which only `search()`'s admission loop knows how to
+    /// consume — the signal and its predicate are private to this module, so a
+    /// caller of `run_knn_brute_force` could not recognise it and retry. A
+    /// background flush that straddled the capture therefore failed the run
+    /// with `Fts(collection capture crossed a publication)`, which is exactly
+    /// how `exact_scan_is_bit_identical_to_the_clone_everything_scan` failed 7
+    /// runs in 10 inside its group while passing alone.
+    #[tokio::test]
+    async fn an_exact_scan_waits_out_a_publication_bracket_instead_of_failing() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("scan-crossed", vector_schema(None))
+            .unwrap();
+        let idx = engine.get_index("scan-crossed").unwrap();
+        idx.schema.write().await.dynamic = xerj_common::schema::DynamicMapping::Runtime;
+        seed(&idx).await;
+        let query = Lcg(7).vector();
+        let request = SearchRequest {
+            size: 10,
+            ..SearchRequest::default()
+        };
+
+        // A writer bracket open across the scan's capture: the generation it
+        // reads before the memtable capture cannot be the one it validates
+        // after the segment snapshot. `cancel` (not a bare drop) keeps the
+        // index unpoisoned.
+        let mut bracket = idx.collection_publication.begin().unwrap();
+        let scan = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move {
+                idx.run_knn_brute_force(
+                    &request,
+                    "body_vector",
+                    &query,
+                    10,
+                    None,
+                    "cosine",
+                    None,
+                    None,
+                )
+                .await
+            })
+        };
+        // Long enough for the scan to reach the capture check and lose it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        bracket.cancel();
+        drop(bracket);
+
+        let hits = scan
+            .await
+            .unwrap()
+            .expect("a bracket that closed inside the deadline is recaptured, not surfaced");
+        assert_eq!(
+            hits.hits.len(),
+            10,
+            "the retried scan answers the same page it would have without the bracket"
+        );
     }
 
     #[tokio::test]
