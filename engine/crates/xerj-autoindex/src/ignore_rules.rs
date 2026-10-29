@@ -114,6 +114,16 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     "build/",
     ".venv/",
     "__pycache__/",
+    // Backup and patch copies of a file that is already in the tree (#2402).
+    // These are the same bytes as a document indexed under its real name, so
+    // each one is a duplicate hit competing with the document it copies — a
+    // field report had four copies of one passage in its top five results.
+    // `!*.bak` in an ignore file puts one back.
+    "*.bak",
+    "*.orig",
+    "*.rej",
+    "*.old",
+    "*~",
     // Media and native binaries. Sniffing classifies these as binary and
     // records each one as junk, so a repo of images and shared libraries
     // spent the walk opening files that can never become a document. A
@@ -1369,6 +1379,58 @@ mod tests {
         write(root, "vendor/lib/lib.go", "x");
         let (kept, _) = survivors(root, IgnoreOptions::default());
         assert_eq!(kept, vec!["vendor/lib/lib.go"], "{kept:?}");
+    }
+
+    /// #2402: a workspace whose docs directory held backup copies of one
+    /// document returned that passage four times in the top five hits, so an
+    /// agent spent its budget reading the same text under four paths. A copy
+    /// is not a document anyone searches for — it is the same bytes as a file
+    /// that is indexed under its real name — so the built-in list drops it the
+    /// way it drops build output.
+    #[test]
+    fn defaults_prune_backup_copies_of_an_indexed_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "docs/manual.md", "the real document");
+        write(root, "docs/manual.md.bak", "the real document");
+        write(root, "docs/manual.md.orig", "the real document");
+        write(root, "docs/manual.md.rej", "the real document");
+        write(root, "docs/manual.md.old", "the real document");
+        write(root, "docs/manual.md~", "the real document");
+
+        let (kept, report) = survivors(root, IgnoreOptions::default());
+        assert_eq!(kept, vec!["docs/manual.md"], "{kept:?}");
+        assert!(
+            report.by_rule.contains_key("<built-in>:*.bak"),
+            "{report:?}"
+        );
+        assert_eq!(report.files_skipped, 5, "{report:?}");
+
+        // Defaults, not law: the flag keeps every copy, and a `!` line puts
+        // one back without the rest.
+        let (all, _) = survivors(
+            root,
+            IgnoreOptions {
+                defaults: false,
+                ..IgnoreOptions::default()
+            },
+        );
+        assert_eq!(
+            all.len(),
+            6,
+            "--no-default-ignores keeps the copies: {all:?}"
+        );
+
+        write(root, ".xerjignore", "!*.bak\n");
+        let (reincluded, _) = survivors(root, IgnoreOptions::default());
+        assert!(
+            reincluded.iter().any(|p| p == "docs/manual.md.bak"),
+            "a negation must put the .bak back: {reincluded:?}"
+        );
+        assert!(
+            !reincluded.iter().any(|p| p.ends_with(".orig")),
+            "the other backup suffixes stay skipped: {reincluded:?}"
+        );
     }
 
     /// `third_party/` and `bower_components/` are committed dependency trees.
