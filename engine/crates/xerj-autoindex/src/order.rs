@@ -131,7 +131,12 @@ const VENDORED_DIRS: &[&str] = &[
 ];
 
 /// Whole-file names that are machine-written by construction.
-const GENERATED_FILES: &[&str] = &[
+///
+/// Every entry is a lockfile, and `StubMatcher` seeds these as its built-in
+/// `--stub` defaults (#2439): one is a single generated document with no
+/// prose to read, so indexing its contents costs the run and returns nothing
+/// a reader wants. Demotion below only moves it down the queue.
+pub(crate) const GENERATED_FILES: &[&str] = &[
     "Cargo.lock",
     "Gemfile.lock",
     "composer.lock",

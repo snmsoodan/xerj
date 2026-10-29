@@ -1070,7 +1070,8 @@ fn project_reconcile_plan(
         inventory.files.len() as u64,
         inventory.files.iter().map(|file| file.size).sum(),
     );
-    let stub_matcher = StubMatcher::compile(&cfg.stub_globs).expect("validated at startup");
+    let stub_matcher =
+        StubMatcher::compile(&cfg.stub_globs, !cfg.no_default_stubs).expect("validated at startup");
     let scans: Vec<FileScan> = crate::pool::install(|| {
         use rayon::prelude::*;
         inventory
@@ -3747,6 +3748,13 @@ const MAX_STUB_GLOB_LEN: usize = 4096;
 /// the owner's way of saying "this data blob should be referenceable but
 /// not parsed" without the engine hardcoding per-corpus rules.
 ///
+/// `defaults` seeds [`order::GENERATED_FILES`] — the lockfiles — ahead of the
+/// operator's globs (#2439). They are stubbed for the same reason a person
+/// writes `--stub package-lock.json` by hand: the file is one machine-written
+/// document, so reading it stalls the queue for minutes and yields nothing to
+/// search. `--no-default-stubs` clears the seed; the operator's own `--stub`
+/// globs are unaffected either way.
+///
 /// Glob semantics (gitignore-flavored): `**` crosses `/`, `*` and `?` do
 /// not; a pattern without `/` matches against the file NAME anywhere in the
 /// tree, a pattern with `/` matches the full root-relative path.
@@ -3756,10 +3764,17 @@ pub struct StubMatcher {
 }
 
 impl StubMatcher {
-    pub fn compile(globs: &[String]) -> Result<Self> {
+    pub fn compile(globs: &[String], defaults: bool) -> Result<Self> {
         let mut by_name = Vec::new();
         let mut by_path = Vec::new();
-        for g in globs {
+        let seeded = defaults.then_some(crate::order::GENERATED_FILES);
+        let patterns = seeded
+            .into_iter()
+            .flatten()
+            .copied()
+            .map(str::to_owned)
+            .chain(globs.iter().cloned());
+        for g in patterns {
             // `glob_to_regex` escapes every metacharacter, so no glob can
             // produce a SYNTACTICALLY invalid regex — the only reachable
             // failure is the compiled-size limit, which `?` (→ `[^/]`) and
@@ -3773,7 +3788,7 @@ impl StubMatcher {
                     g.len()
                 );
             }
-            let re = regex::Regex::new(&glob_to_regex(g))
+            let re = regex::Regex::new(&glob_to_regex(&g))
                 .with_context(|| format!("--stub {g}: invalid pattern"))?;
             if g.contains('/') {
                 by_path.push(re);
@@ -3852,7 +3867,21 @@ mod stub_matcher_tests {
     use super::StubMatcher;
 
     fn m(globs: &[&str]) -> StubMatcher {
-        StubMatcher::compile(&globs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        // Operator globs with the built-in lockfile seed off: these tests are
+        // about the glob language, not the defaults.
+        StubMatcher::compile(
+            &globs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap()
+    }
+
+    fn m_defaults(globs: &[&str]) -> StubMatcher {
+        StubMatcher::compile(
+            &globs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            true,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3885,12 +3914,64 @@ mod stub_matcher_tests {
         assert!(!s.matches("x/dataXv1Y.csv"));
     }
 
+    /// #2439: a lockfile is one machine-written document. Reading it stalls
+    /// the queue (`waiting_on=package-lock.json(410.5KB)` for minutes) and
+    /// returns nothing a reader searches for, so the built-in seed makes it a
+    /// name card the way a person writing `--stub package-lock.json` by hand
+    /// does. Every name `order.rs` already calls generated is covered, at any
+    /// depth, because a monorepo keeps one per package.
+    #[test]
+    fn lockfiles_are_stubbed_by_default() {
+        let s = m_defaults(&[]);
+        for name in crate::order::GENERATED_FILES {
+            assert!(s.matches(name), "{name} must be stubbed by default");
+            assert!(
+                s.matches(&format!("frontend/packages/app/{name}")),
+                "a nested {name} must be stubbed too"
+            );
+        }
+        assert!(s.matches("Cargo.lock"));
+        assert!(s.matches("web/pnpm-lock.yaml"));
+        // Not lockfiles: the seed must not quietly stub real content.
+        for keep in [
+            "package.json",
+            "Cargo.toml",
+            "go.mod",
+            "lock.json",
+            "locks.rs",
+        ] {
+            assert!(!s.matches(keep), "{keep} is not a lockfile");
+        }
+    }
+
+    /// The seed is a default, not law: `--no-default-stubs` puts the
+    /// lockfiles back on the ordinary parse path, and the operator's own
+    /// globs keep working with the seed off.
+    #[test]
+    fn no_default_stubs_leaves_lockfiles_alone() {
+        let off = m(&[]);
+        assert!(!off.matches("package-lock.json"));
+        assert!(!off.matches("frontend/yarn.lock"));
+        let operator = m(&["*.lock"]);
+        assert!(operator.matches("yarn.lock"), "the glob still applies");
+        assert!(!operator.matches("yarn.lock.bak"), "one pattern, one shape");
+    }
+
+    /// A `--stub` glob and the seed are additive: neither replaces the other.
+    #[test]
+    fn an_operator_glob_adds_to_the_lockfile_seed() {
+        let s = m_defaults(&["*.bvh"]);
+        assert!(s.matches("motion/walk.bvh"));
+        assert!(s.matches("package-lock.json"));
+        assert!(!s.matches("motion/walk.csv"));
+    }
+
     #[test]
     fn an_invalid_pattern_fails_loudly_at_startup() {
         // The old body asserted only that a VALID pattern compiles, so it
         // never tested its own name and would have passed against a `compile`
         // that could not fail at all.
-        let msg = match StubMatcher::compile(&["?".repeat(super::MAX_STUB_GLOB_LEN + 1)]) {
+        let msg = match StubMatcher::compile(&["?".repeat(super::MAX_STUB_GLOB_LEN + 1)], false) {
             Ok(_) => panic!("an over-long pattern must be refused"),
             Err(e) => e.to_string(),
         };
@@ -3909,7 +3990,7 @@ mod stub_matcher_tests {
     fn regex_syntax_in_a_glob_is_never_a_compile_error() {
         for g in ["[", "(", "\\", "*?[a-", "a{2,", "(?P<x>", "+", "|", "^$"] {
             assert!(
-                StubMatcher::compile(&[g.to_string()]).is_ok(),
+                StubMatcher::compile(&[g.to_string()], false).is_ok(),
                 "{g} must compile: metacharacters are escaped, not interpreted"
             );
         }
@@ -4589,6 +4670,7 @@ mod phase_a_grouping_tests {
             root: root.to_path_buf(),
             endpoint_url: None,
             stub_globs: Vec::new(),
+            no_default_stubs: false,
             url: "http://unused.invalid".into(),
             api_key: None,
             api_key_file: None,
@@ -4663,6 +4745,35 @@ mod phase_a_grouping_tests {
             tally: &ScanTally::default(),
         };
         build_phase_a(root, &files, &keys, &digests, Vec::new(), &ctx, cfg).plan
+    }
+
+    /// #2439: the plan is where a lockfile becomes a name card — one
+    /// `Family::Stub` record instead of a whole-document parse, which is the
+    /// `waiting_on=package-lock.json(410.5KB)` stall the field report hit.
+    /// `--no-default-stubs` restores the ordinary family.
+    #[test]
+    fn a_lockfile_is_planned_as_a_name_card_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            "{\"lockfileVersion\":3,\"packages\":{}}",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("notes.md"), "# Notes\n\nProse.\n").unwrap();
+        let planned_family = |plan: &Plan| {
+            plan.files
+                .values()
+                .find(|f| f.rel == "package-lock.json")
+                .unwrap_or_else(|| panic!("lockfile missing from plan: {plan:#?}"))
+                .family
+                .clone()
+        };
+
+        assert_eq!(planned_family(&plan_for(dir.path())), "stub");
+
+        let mut cfg = cfg_for(dir.path());
+        cfg.no_default_stubs = true;
+        assert_eq!(planned_family(&plan_for_cfg(dir.path(), &cfg)), "json");
     }
 
     /// #1978: the semantic cap sees the array's real length, not the 500-row
@@ -5458,7 +5569,8 @@ fn build_phase_a(
     // spooled is counted exactly like a plainly parsed one.
     // Patterns were validated (loudly) at run start; a failure here would be
     // a programming error, not user input.
-    let stub_matcher = StubMatcher::compile(&cfg.stub_globs).expect("validated at startup");
+    let stub_matcher =
+        StubMatcher::compile(&cfg.stub_globs, !cfg.no_default_stubs).expect("validated at startup");
     let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
     let scopes = compute_scopes(root, &rels);
     // (family, gzip) per file, from the scan's sniff — reused for assignments
@@ -8306,6 +8418,9 @@ fn legacy_rebuild_argv(cfg: &IndexCfg, state_dir: &Path, prefix: &str) -> Vec<St
         argv.push("--stub".to_owned());
         argv.push(glob.clone());
     }
+    if cfg.no_default_stubs {
+        argv.push("--no-default-stubs".to_owned());
+    }
     if !cfg.ignore.enabled {
         argv.push("--no-ignore".to_owned());
     } else if !cfg.ignore.defaults {
@@ -8489,7 +8604,7 @@ fn run_index_report_inner(
             None => None,
         };
 
-    let stub_matcher = StubMatcher::compile(&cfg.stub_globs)?;
+    let stub_matcher = StubMatcher::compile(&cfg.stub_globs, !cfg.no_default_stubs)?;
     // An `s3://`/`r2://` positional argument becomes a local mirror directory
     // here, before any state is opened: `cfg.root` is rewritten to that mirror,
     // so every later phase — walk, hash, plan, journal, reconcile — is the code

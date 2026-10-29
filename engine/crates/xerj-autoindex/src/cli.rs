@@ -85,6 +85,9 @@ pub struct IndexCfg {
     /// `--stub <glob>` patterns: matching files are indexed as one
     /// existence-only name card, contents never opened.
     pub stub_globs: Vec<String>,
+    /// `--no-default-stubs`: drop the built-in lockfile stub defaults
+    /// (#2439). The operator's own `--stub` globs still apply.
+    pub no_default_stubs: bool,
     /// `.gitignore` / `.xerjignore` / built-in build-output rules (#276).
     /// `deep_count` is set from `--dry-run` (and from `--walk-only`, which
     /// implies it).
@@ -395,7 +398,14 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20opened. Repeatable. A pattern without '/'\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20matches file names anywhere ('*.bvh'); with '/'\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20it matches the root-relative path\n\
-         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20('unity/**/*.csv'). '**' crosses directories\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20('unity/**/*.csv'). '**' crosses directories.\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20Lockfiles are stubbed without asking\n\
+         \x20\x20\x20\x20--no-default-stubs   index lockfile CONTENTS again. package-lock.json,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20yarn.lock, pnpm-lock.yaml, Cargo.lock, go.sum and the\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20other lockfiles are name cards by default, because\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20one machine-written document stalls the queue and\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20nothing in it is worth reading. Your own --stub\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20globs still apply\n\
          \x20\x20\x20\x20--no-ignore          index everything: no .gitignore, no .xerjignore, no\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20.git/info/exclude, no built-in defaults. Hidden files\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(.env, .git/, .ssh) stay skipped either way — that is\n\
@@ -939,6 +949,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut follow_symlinks = false;
     let mut follow_symlinks_outside_root = false;
     let mut stub_globs: Vec<String> = Vec::new();
+    let mut no_default_stubs = false;
     let mut no_ignore = false;
     let mut no_default_ignores = false;
     // One of --max-file-gb / --max-file-mb / --max-file-bytes sets this, all
@@ -1108,6 +1119,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--follow-symlinks" => follow_symlinks = true,
             "--follow-symlinks-outside-root" => follow_symlinks_outside_root = true,
             "--stub" => stub_globs.push(it.next().ok_or("--stub needs a glob pattern")?),
+            "--no-default-stubs" => no_default_stubs = true,
             "--no-ignore" => no_ignore = true,
             "--no-default-ignores" => no_default_ignores = true,
             "--max-file-gb" => {
@@ -1926,6 +1938,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 follow_symlinks,
                 follow_symlinks_outside_root,
                 stubs: !stub_globs.is_empty(),
+                no_default_stubs,
                 ignore: !ignore_flags_used.is_empty(),
                 max_file: max_file_bytes.is_some(),
                 sample: sample != 500,
@@ -2088,6 +2101,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 follow_symlinks,
                 follow_symlinks_outside_root,
                 stub_globs,
+                no_default_stubs,
                 ignore: IgnoreOptions {
                     enabled: !no_ignore,
                     defaults: !no_ignore && !no_default_ignores,
@@ -2148,6 +2162,7 @@ struct RemoveReject {
     follow_symlinks: bool,
     follow_symlinks_outside_root: bool,
     stubs: bool,
+    no_default_stubs: bool,
     ignore: bool,
     max_file: bool,
     sample: bool,
@@ -2215,6 +2230,7 @@ fn remove_cmd(input: RemoveParse) -> Result<Cmd, String> {
             reject.follow_symlinks_outside_root,
         ),
         ("--stub", reject.stubs),
+        ("--no-default-stubs", reject.no_default_stubs),
         ("--no-ignore", reject.ignore),
         ("--max-file-bytes", reject.max_file),
         ("--sample", reject.sample),
@@ -2615,6 +2631,23 @@ mod tests {
 
     fn err(args: &[&str]) -> String {
         parse(args.iter().map(|s| s.to_string()).collect()).expect_err("must be refused")
+    }
+
+    /// #2439: the flag reaches the config, and `remove` refuses it exactly
+    /// as it refuses `--stub` — it deletes by prefix and indexes nothing, so
+    /// neither flag can change what it does.
+    #[test]
+    fn no_default_stubs_reaches_the_config_and_is_refused_by_remove_like_stub() {
+        assert!(!index(&["data"]).no_default_stubs, "the seed stays on");
+        assert!(index(&["data", "--no-default-stubs"]).no_default_stubs);
+        for args in [
+            vec!["remove", "--prefix", "ax", "--stub", "*.bvh"],
+            vec!["remove", "--prefix", "ax", "--no-default-stubs"],
+        ] {
+            let err = parse(args.iter().map(|a| a.to_string()).collect()).unwrap_err();
+            let flag = args[3];
+            assert!(err.contains(flag), "{flag} must be named: {err}");
+        }
     }
 
     /// The `--watch` refusal must name the limitation it actually has.

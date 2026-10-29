@@ -1125,6 +1125,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
         root: root.to_owned(),
         endpoint_url: None,
         stub_globs: Vec::new(),
+        no_default_stubs: false,
         url: url.to_owned(),
         api_key: None,
         api_key_file: None,
