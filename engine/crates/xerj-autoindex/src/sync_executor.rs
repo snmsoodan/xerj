@@ -2341,13 +2341,16 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         // makes it fail loud either way.
         for group in changed_groups {
             let mut records = 0u64;
+            let mut per_index: Vec<(String, u64)> = Vec::new();
             for index in group_indices(group, &desired.plan)? {
-                records += record_counts[&index][&group.content_id];
+                let live = record_counts[&index][&group.content_id];
+                records += live;
+                per_index.push((index, live));
             }
             anyhow::ensure!(
                 records == group.expected_records,
-                "live record count disagrees with desired group {}",
-                group.group_id
+                "{}",
+                record_count_mismatch_line(group, records, &per_index)
             );
             let mut semantic = 0u64;
             for slug in &group.dataset_slugs {
@@ -2796,6 +2799,37 @@ fn prepared_for<'a>(
         .find(|file| file.content_id == content_id)
         .and_then(|file| file.prepared.as_ref())
         .with_context(|| format!("content {content_id} has no sealed prepared artifact"))
+}
+
+/// #2669: the abort that a resume can repeat for an hour used to name only the
+/// group id, so the operator learned neither how far off the read-back was nor
+/// what to do about it. It now carries the same numbers as the semantic check
+/// below it, the per-index split that says which dataset drifted, and the two
+/// commands that repair it. A resume cannot fix a mismatched group on its own
+/// yet, so the abort has to say that rerunning it will abort again.
+fn record_count_mismatch_line(
+    group: &ManifestGroup,
+    live: u64,
+    per_index: &[(String, u64)],
+) -> String {
+    let breakdown = if per_index.is_empty() {
+        "none (the plan lists no index for this group)".to_string()
+    } else {
+        per_index
+            .iter()
+            .map(|(index, count)| format!("{index}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let difference = live as i64 - group.expected_records as i64;
+    format!(
+        "live record count disagrees with desired group {}: live_records={live}, \
+         expected_records={}, difference={difference}, indices=[{breakdown}]. A resume cannot \
+         reconcile a mismatched group yet, so rerunning this command aborts again the \
+         same way. Repair: rerun with --fresh to rebuild the prefix from scratch, or \
+         delete the prefix's indices (xerj autoindex remove) and rerun",
+        group.group_id, group.expected_records,
+    )
 }
 
 fn group_indices(group: &ManifestGroup, plan: &Plan) -> Result<Vec<String>> {
@@ -4156,6 +4190,47 @@ mod tests {
     use std::collections::BTreeMap;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+
+    /// #2669: the record-count abort used to name only the group, so an
+    /// operator watching a resume fail twice could not tell a one-record drift
+    /// from a lost dataset, and had no repair to run.
+    #[test]
+    fn a_record_count_mismatch_names_the_counts_the_indices_and_the_repair() {
+        let group = ManifestGroup {
+            group_id: "axg1-6ea07c09".into(),
+            content_id: "cid-6ea07c09".into(),
+            content_digest: "sha256:0".into(),
+            content_size: 1,
+            canonical: ManifestPath {
+                path_id: "unix:646f6373".into(),
+                rel: "docs/readme.md".into(),
+                is_symlink: false,
+            },
+            aliases: Vec::new(),
+            dataset_slugs: vec!["code".into(), "notes".into()],
+            expected_records: 185_000,
+            expected_passages: 0,
+            expected_vectors: 0,
+            expected_junk_records: 0,
+            expected_records_by_dataset: BTreeMap::new(),
+        };
+        let line = record_count_mismatch_line(
+            &group,
+            279_231,
+            &[("ax-code".into(), 279_000), ("ax-notes".into(), 231)],
+        );
+        assert!(line.contains("live_records=279231"), "{line}");
+        assert!(line.contains("expected_records=185000"), "{line}");
+        assert!(line.contains("difference=94231"), "{line}");
+        assert!(
+            line.contains("indices=[ax-code=279000, ax-notes=231]"),
+            "the per-index split says which dataset drifted: {line}"
+        );
+        assert!(
+            line.contains("--fresh") && line.contains("xerj autoindex remove"),
+            "the abort has to carry a repair, or a resume repeats it: {line}"
+        );
+    }
 
     fn inventory(root: &Path) -> Inventory {
         crate::content::resolve_reporting(walk::walk(root, false).unwrap(), &|_| {}).unwrap()
