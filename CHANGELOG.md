@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `xerj autoindex --exclude <glob>` leaves matching paths out of the index
+  without editing an ignore file or deleting anything. Repeatable, same glob
+  syntax as `--stub` — a pattern without `/` matches a file name at any depth,
+  one with `/` is anchored at the root. The run reports how many paths it left
+  out (#2483).
+
 - Offline `xerj sessions import --format codex` exports a documented subset
   of one archived Codex rollout through the existing text redactor. It skips
   tools and reasoning, retains physical source locations and archive event

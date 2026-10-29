@@ -149,6 +149,11 @@ pub struct IndexCfg {
     /// `xerj autoindex <folder>`. `xerj corpus index` sets `corpus.json` so
     /// the hub manifest is not indexed as a document dataset.
     pub exclude_rels: Vec<String>,
+    /// `--exclude <glob>` patterns (#2483): root-relative paths left out of
+    /// the walk's inventory. Same glob syntax as [`Self::stub_globs`]. Unlike
+    /// an ignore file this needs nothing on disk, so a generated tree can be
+    /// skipped without touching the checkout.
+    pub exclude: Vec<String>,
     /// `xerj corpus index` only (#1985): skip data files (CSV/HDF/simulation
     /// output — see [`crate::CORPUS_DATA_EXTS`]) instead of indexing them as
     /// records. `--include-data` turns it off. Never set by
@@ -403,6 +408,10 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20matches file names anywhere ('*.bvh'); with '/'\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20it matches the root-relative path\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20('unity/**/*.csv'). '**' crosses directories\n\
+         \x20\x20\x20\x20--exclude <GLOB>     leave matching paths out of the index entirely (not\n\\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20walked, not counted). Repeatable, same glob syntax\n\\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20as --stub ('gen/**', '*.log'). Use it for a tree you do\n\\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20not want to edit an ignore file for.\n\\
          \x20\x20\x20\x20--no-ignore          index everything: no .gitignore, no .xerjignore, no\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20.git/info/exclude, no built-in defaults. Hidden files\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(.env, .git/, .ssh) stay skipped either way — that is\n\
@@ -945,6 +954,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut follow_symlinks = false;
     let mut follow_symlinks_outside_root = false;
     let mut stub_globs: Vec<String> = Vec::new();
+    let mut exclude_globs: Vec<String> = Vec::new();
     let mut no_ignore = false;
     let mut no_default_ignores = false;
     // One of --max-file-gb / --max-file-mb / --max-file-bytes sets this, all
@@ -1115,6 +1125,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             "--follow-symlinks" => follow_symlinks = true,
             "--follow-symlinks-outside-root" => follow_symlinks_outside_root = true,
             "--stub" => stub_globs.push(it.next().ok_or("--stub needs a glob pattern")?),
+            "--exclude" => exclude_globs.push(it.next().ok_or("--exclude needs a glob pattern")?),
             "--no-ignore" => no_ignore = true,
             "--no-default-ignores" => no_default_ignores = true,
             "--max-file-gb" => {
@@ -1954,6 +1965,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 follow_symlinks,
                 follow_symlinks_outside_root,
                 stubs: !stub_globs.is_empty(),
+                excludes: !exclude_globs.is_empty(),
                 ignore: !ignore_flags_used.is_empty(),
                 max_file: max_file_bytes.is_some(),
                 sample: sample != 500,
@@ -2147,6 +2159,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                     debounce_ms.unwrap_or(crate::watch::DEFAULT_DEBOUNCE_MS),
                 ),
                 exclude_rels: Vec::new(),
+                exclude: exclude_globs,
                 skip_corpus_data: false,
             })))
         }
@@ -2176,6 +2189,7 @@ struct RemoveReject {
     follow_symlinks: bool,
     follow_symlinks_outside_root: bool,
     stubs: bool,
+    excludes: bool,
     ignore: bool,
     max_file: bool,
     sample: bool,
@@ -2243,6 +2257,7 @@ fn remove_cmd(input: RemoveParse) -> Result<Cmd, String> {
             reject.follow_symlinks_outside_root,
         ),
         ("--stub", reject.stubs),
+        ("--exclude", reject.excludes),
         ("--no-ignore", reject.ignore),
         ("--max-file-bytes", reject.max_file),
         ("--sample", reject.sample),
@@ -4109,5 +4124,21 @@ mod tests {
             both.contains("already turns off"),
             "the preview walks, so the redundant ignore pair is the indexing error: {both}"
         );
+    }
+
+    /// #2483: `--exclude` takes one glob per flag, so a run can name several
+    /// generated trees without comma-splitting a single value.
+    #[test]
+    fn exclude_is_repeatable_and_keeps_the_patterns_in_order() {
+        let cfg = index(&["data", "--exclude", "gen/**", "--exclude", "*.log"]);
+        assert_eq!(cfg.exclude, ["gen/**", "*.log"]);
+        assert!(index(&["data"]).exclude.is_empty());
+    }
+
+    /// A missing value is a usage error naming the flag, not a silent no-op.
+    #[test]
+    fn exclude_without_a_pattern_is_refused() {
+        let text = err(&["data", "--exclude"]);
+        assert!(text.contains("--exclude needs a glob pattern"), "{text}");
     }
 }

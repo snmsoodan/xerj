@@ -1070,7 +1070,8 @@ fn project_reconcile_plan(
         inventory.files.len() as u64,
         inventory.files.iter().map(|file| file.size).sum(),
     );
-    let stub_matcher = StubMatcher::compile(&cfg.stub_globs).expect("validated at startup");
+    let stub_matcher =
+        GlobMatcher::compile(&cfg.stub_globs, "--stub").expect("validated at startup");
     let scans: Vec<FileScan> = crate::pool::install(|| {
         use rayon::prelude::*;
         inventory
@@ -2573,22 +2574,30 @@ pub fn run_cli() -> i32 {
 /// [`run_with_options`]; a folder named the same way is still indexed.
 const CORPUS_MANIFEST_REL: &str = "corpus.json";
 
-/// Drop walk entries whose root-relative path is in `exclude`. An empty list
-/// returns the walk unchanged, so this is not a global skip of that filename.
+/// Drop walk entries whose root-relative path is in `exclude`, and every
+/// entry the `--exclude <glob>` patterns match (#2483). Both empty returns the
+/// walk unchanged, so neither is a global skip of a filename.
+///
+/// The filter runs after the walk rather than inside it because the walker has
+/// no notion of a user glob — ignore rules reach it as parsed ignore files —
+/// and because `--walk-only`'s per-folder summary is built from the filtered
+/// list, so both exclusion routes drop a path the same way.
 fn without_excluded_rels(
     files: Vec<walk::FileEntry>,
     exclude: &[String],
-) -> (Vec<walk::FileEntry>, usize) {
-    if exclude.is_empty() {
-        return (files, 0);
+    globs: &[String],
+) -> Result<(Vec<walk::FileEntry>, usize)> {
+    if exclude.is_empty() && globs.is_empty() {
+        return Ok((files, 0));
     }
+    let matcher = GlobMatcher::compile(globs, "--exclude")?;
     let before = files.len();
     let kept: Vec<walk::FileEntry> = files
         .into_iter()
-        .filter(|file| !exclude.contains(&file.rel))
+        .filter(|file| !exclude.contains(&file.rel) && !matcher.matches(&file.rel))
         .collect();
     let dropped = before - kept.len();
-    (kept, dropped)
+    Ok((kept, dropped))
 }
 
 /// Extensions that are DATA in a cloned reference repo, not reference material
@@ -2855,7 +2864,8 @@ mod exclude_rels_tests {
             entry("src/lib.rs"),
             entry("vendor/corpus.json"),
         ];
-        let (kept, dropped) = without_excluded_rels(files, &[CORPUS_MANIFEST_REL.to_string()]);
+        let (kept, dropped) =
+            without_excluded_rels(files, &[CORPUS_MANIFEST_REL.to_string()], &[]).unwrap();
         assert_eq!(dropped, 1);
         let rels: Vec<&str> = kept.iter().map(|file| file.rel.as_str()).collect();
         assert_eq!(rels, ["src/lib.rs", "vendor/corpus.json"]);
@@ -2864,9 +2874,72 @@ mod exclude_rels_tests {
     #[test]
     fn an_empty_exclusion_list_keeps_a_root_corpus_json() {
         let files = vec![entry("corpus.json"), entry("README.md")];
-        let (kept, dropped) = without_excluded_rels(files, &[]);
+        let (kept, dropped) = without_excluded_rels(files, &[], &[]).unwrap();
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 2);
+    }
+
+    /// #2483: `--exclude <glob>` leaves a generated tree out of the index
+    /// without deleting it or editing an ignore file. A pattern with `/` is
+    /// anchored at the root, so `gen/**` takes the whole folder and nothing
+    /// that merely ends in the same name elsewhere.
+    #[test]
+    fn an_exclude_glob_drops_a_whole_subtree_and_counts_it() {
+        let files = vec![
+            entry("src/main.rs"),
+            entry("gen/deep/generated.java"),
+            entry("gen/notes.md"),
+            entry("vendor/gen/kept.md"),
+        ];
+        let (kept, dropped) = without_excluded_rels(files, &[], &["gen/**".to_string()]).unwrap();
+        assert_eq!(dropped, 2);
+        let rels: Vec<&str> = kept.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(rels, ["src/main.rs", "vendor/gen/kept.md"]);
+    }
+
+    /// A pattern without `/` is a NAME pattern and matches at any depth, the
+    /// same rule `--stub` follows — so one flag can clear build droppings from
+    /// every folder without listing each one.
+    #[test]
+    fn a_bare_exclude_glob_matches_the_name_at_any_depth() {
+        let files = vec![
+            entry("app.log"),
+            entry("logs/app.log"),
+            entry("deep/nested/trace.log"),
+            entry("app.log.md"),
+        ];
+        let (kept, dropped) = without_excluded_rels(files, &[], &["*.log".to_string()]).unwrap();
+        assert_eq!(dropped, 3);
+        let rels: Vec<&str> = kept.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(rels, ["app.log.md"]);
+    }
+
+    /// Both exclusion routes apply in one pass: the exact-rel list
+    /// `corpus index` uses for `corpus.json` and the user's globs.
+    #[test]
+    fn an_exclude_glob_composes_with_an_exact_exclusion() {
+        let files = vec![entry("corpus.json"), entry("gen/x.rs"), entry("src/lib.rs")];
+        let (kept, dropped) = without_excluded_rels(
+            files,
+            &[CORPUS_MANIFEST_REL.to_string()],
+            &["gen/**".to_string()],
+        )
+        .unwrap();
+        assert_eq!(dropped, 2);
+        let rels: Vec<&str> = kept.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(rels, ["src/lib.rs"]);
+    }
+
+    /// A pattern over the length limit is reported against `--exclude`, so a
+    /// rejected glob names the flag to fix instead of surfacing a
+    /// regex-internal error.
+    #[test]
+    fn an_over_long_exclude_glob_names_the_flag() {
+        let msg = without_excluded_rels(vec![], &[], &["?".repeat(MAX_GLOB_LEN + 1)])
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("--exclude"), "{msg}");
+        assert!(msg.contains(&MAX_GLOB_LEN.to_string()), "{msg}");
     }
 }
 
@@ -3744,27 +3817,28 @@ fn section_label(locator: &str) -> Option<String> {
     (digits(page) && digits(sec)).then(|| format!("page {page} section {sec}"))
 }
 
-// ─── --stub glob matcher ──────────────────────────────────────────────────
+// ─── glob matchers (`--stub`, `--exclude`) ────────────────────────────────
 
-/// Longest accepted `--stub` glob. Far beyond any pattern a person types,
-/// and far below the length at which the compiled regex hits its size limit.
-const MAX_STUB_GLOB_LEN: usize = 4096;
+/// Longest accepted glob. Far beyond any pattern a person types, and far
+/// below the length at which the compiled regex hits its size limit.
+const MAX_GLOB_LEN: usize = 4096;
 
-/// Compiled `--stub <glob>` patterns. A matching file is indexed as ONE
-/// name-card record (`Family::Stub`) and its contents are never opened —
-/// the owner's way of saying "this data blob should be referenceable but
-/// not parsed" without the engine hardcoding per-corpus rules.
+/// Compiled glob patterns for one flag. `--stub` uses it to decide which
+/// files become name cards; `--exclude` uses it to leave paths out of the
+/// walk's inventory entirely (#2483).
 ///
 /// Glob semantics (gitignore-flavored): `**` crosses `/`, `*` and `?` do
 /// not; a pattern without `/` matches against the file NAME anywhere in the
 /// tree, a pattern with `/` matches the full root-relative path.
-pub struct StubMatcher {
+pub struct GlobMatcher {
     by_name: Vec<regex::Regex>,
     by_path: Vec<regex::Regex>,
 }
 
-impl StubMatcher {
-    pub fn compile(globs: &[String]) -> Result<Self> {
+impl GlobMatcher {
+    /// `flag` names the option the patterns came from, so a rejected pattern
+    /// says which one to fix.
+    pub fn compile(globs: &[String], flag: &str) -> Result<Self> {
         let mut by_name = Vec::new();
         let mut by_path = Vec::new();
         for g in globs {
@@ -3774,15 +3848,15 @@ impl StubMatcher {
             // `**` (→ `.*`) reach at ~10^5 characters. Caught here by length
             // so the message names the flag and the cause instead of
             // surfacing a regex-internal "compiled regex exceeds size limit".
-            if g.len() > MAX_STUB_GLOB_LEN {
+            if g.len() > MAX_GLOB_LEN {
                 anyhow::bail!(
-                    "--stub {}…: pattern is {} characters (limit {MAX_STUB_GLOB_LEN})",
+                    "{flag} {}…: pattern is {} characters (limit {MAX_GLOB_LEN})",
                     g.chars().take(40).collect::<String>(),
                     g.len()
                 );
             }
             let re = regex::Regex::new(&glob_to_regex(g))
-                .with_context(|| format!("--stub {g}: invalid pattern"))?;
+                .with_context(|| format!("{flag} {g}: invalid pattern"))?;
             if g.contains('/') {
                 by_path.push(re);
             } else {
@@ -3857,10 +3931,14 @@ fn stub_sniffed(logical_path: &Path) -> Sniffed {
 
 #[cfg(test)]
 mod stub_matcher_tests {
-    use super::StubMatcher;
+    use super::GlobMatcher;
 
-    fn m(globs: &[&str]) -> StubMatcher {
-        StubMatcher::compile(&globs.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    fn m(globs: &[&str]) -> GlobMatcher {
+        GlobMatcher::compile(
+            &globs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "--stub",
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3898,13 +3976,13 @@ mod stub_matcher_tests {
         // The old body asserted only that a VALID pattern compiles, so it
         // never tested its own name and would have passed against a `compile`
         // that could not fail at all.
-        let msg = match StubMatcher::compile(&["?".repeat(super::MAX_STUB_GLOB_LEN + 1)]) {
+        let msg = match GlobMatcher::compile(&["?".repeat(super::MAX_GLOB_LEN + 1)], "--stub") {
             Ok(_) => panic!("an over-long pattern must be refused"),
             Err(e) => e.to_string(),
         };
         assert!(msg.contains("--stub"), "message must name the flag: {msg}");
         assert!(
-            msg.contains(&super::MAX_STUB_GLOB_LEN.to_string()),
+            msg.contains(&super::MAX_GLOB_LEN.to_string()),
             "message must state the limit: {msg}"
         );
     }
@@ -3917,7 +3995,7 @@ mod stub_matcher_tests {
     fn regex_syntax_in_a_glob_is_never_a_compile_error() {
         for g in ["[", "(", "\\", "*?[a-", "a{2,", "(?P<x>", "+", "|", "^$"] {
             assert!(
-                StubMatcher::compile(&[g.to_string()]).is_ok(),
+                GlobMatcher::compile(&[g.to_string()], "--stub").is_ok(),
                 "{g} must compile: metacharacters are escaped, not interpreted"
             );
         }
@@ -4642,6 +4720,7 @@ mod phase_a_grouping_tests {
             label: None,
             debounce: std::time::Duration::from_millis(0),
             exclude_rels: Vec::new(),
+            exclude: Vec::new(),
             skip_corpus_data: false,
         }
     }
@@ -5466,7 +5545,8 @@ fn build_phase_a(
     // spooled is counted exactly like a plainly parsed one.
     // Patterns were validated (loudly) at run start; a failure here would be
     // a programming error, not user input.
-    let stub_matcher = StubMatcher::compile(&cfg.stub_globs).expect("validated at startup");
+    let stub_matcher =
+        GlobMatcher::compile(&cfg.stub_globs, "--stub").expect("validated at startup");
     let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
     let scopes = compute_scopes(root, &rels);
     // (family, gzip) per file, from the scan's sniff — reused for assignments
@@ -8563,7 +8643,7 @@ fn run_index_report_inner(
             None => None,
         };
 
-    let stub_matcher = StubMatcher::compile(&cfg.stub_globs)?;
+    let stub_matcher = GlobMatcher::compile(&cfg.stub_globs, "--stub")?;
     // An `s3://`/`r2://` positional argument becomes a local mirror directory
     // here, before any state is opened: `cfg.root` is rewritten to that mirror,
     // so every later phase — walk, hash, plan, journal, reconcile — is the code
@@ -8898,11 +8978,14 @@ fn run_index_report_inner(
         cfg.follow_symlinks_outside_root,
         cfg.ignore,
     )?;
-    let (discovered_files, excluded) = without_excluded_rels(discovered_files, &cfg.exclude_rels);
+    let (discovered_files, excluded) =
+        without_excluded_rels(discovered_files, &cfg.exclude_rels, &cfg.exclude)?;
     if excluded > 0 {
+        let mut rules = cfg.exclude_rels.clone();
+        rules.extend(cfg.exclude.iter().map(|glob| format!("--exclude {glob}")));
         pr.note(&format!(
-            "autoindex: left out {excluded} path(s) ({}) — not part of this corpus index",
-            cfg.exclude_rels.join(", ")
+            "autoindex: left out {excluded} path(s) ({}) — not part of this index",
+            rules.join(", ")
         ));
     }
     let (discovered_files, data_files, data_bytes) = if cfg.skip_corpus_data {
